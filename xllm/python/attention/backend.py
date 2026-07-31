@@ -22,7 +22,7 @@ import torch
 if TYPE_CHECKING:
     from xllm.python.layers.attention import Attention
 
-KVCache = tuple[torch.Tensor, torch.Tensor]
+KVCache = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 class AttentionMetadata(Protocol):

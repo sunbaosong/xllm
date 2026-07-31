@@ -195,6 +195,21 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
     int64_t next_tokens,
     int64_t cmp_ratio,
     bool return_value);
+
+torch::Tensor lightning_indexer(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& weights,
+    const c10::optional<torch::Tensor>& query_seq_lengths,
+    const c10::optional<torch::Tensor>& key_seq_lengths,
+    const c10::optional<torch::Tensor>& block_table,
+    c10::string_view layout_query,
+    c10::string_view layout_key,
+    int64_t selected_count,
+    int64_t sparse_mode,
+    int64_t pre_tokens,
+    int64_t next_tokens,
+    bool return_value);
 at::Tensor hc_pre_inv_rms(const at::Tensor& x, double epsilon);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> gamma_add_rms_norm(

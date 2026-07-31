@@ -177,7 +177,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         assert metadata is not None
 
         layer_id = layer.layer_id
-        k_cache, v_cache = self._kv_caches[layer_id]
+        k_cache, v_cache, _ = self._kv_caches[layer_id]
         num_tokens = q.shape[0]
 
         # Write KV to paged cache (kernel expects [T, kv_heads, head_dim]).
@@ -192,6 +192,50 @@ class NpuPagedAttentionBackend(AttentionBackend):
         if metadata.is_prefill or metadata.is_chunked_prefill:
             return self._prefill(q_3d, k_3d, v_3d, metadata, num_tokens)
         return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
+
+    def execute_mla(
+        self,
+        q_latent: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_latent_3d: torch.Tensor,
+        k_pe_3d: torch.Tensor,
+        layer: "Attention",
+        topk=None,
+    ) -> torch.Tensor:
+        """Absorbed-MLA attention. Returns [T, H, kv_lora]; caller bmm's W_UV."""
+        metadata = self._metadata
+        assert metadata is not None, "execute_mla called before prepare()"
+        layer_id = layer.layer_id
+        nope_cache, rope_cache, index_cache = self._kv_caches[layer_id]
+        num_tokens = q_latent.shape[0]
+
+        torch.ops.xllm_ops.reshape_paged_cache(
+            metadata.slot_mapping, k_latent_3d, k_pe_3d, nope_cache, rope_cache
+        )
+        return self._mla_sparse(q_latent, q_pe, nope_cache, rope_cache,
+                                topk, metadata)
+
+    def _mla_sparse(self, q_latent, q_pe, nope_cache, rope_cache, topk,
+                    metadata):
+        kv_seq_lens = metadata.kv_seq_lens
+        batch = kv_seq_lens.size(0)
+        actual_seq_kv = kv_seq_lens.to(torch.int32).to(nope_cache.device)
+        if metadata.q_cu_seq_lens is not None:
+            cu = metadata.q_cu_seq_lens
+            actual_seq_q = cu[1:].to(torch.int32).to(nope_cache.device)
+        else:
+            actual_seq_q = torch.arange(
+                1, batch + 1, dtype=torch.int32, device=nope_cache.device
+            )
+        out = torch.ops.xllm_ops.sparse_flash_attention(
+            q_latent, nope_cache, nope_cache, topk,
+            metadata.block_table,
+            actual_seq_q,
+            actual_seq_kv,
+            q_pe, rope_cache, self.scale, 1,
+            "TND", "PA_BSND", 3,
+        )
+        return out  # [T, H, kv_lora]
 
     # ------------------------------------------------------------------
     # Prefill: packed TND with causal mask
