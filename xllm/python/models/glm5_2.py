@@ -12,20 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GLM-5.2 (model_type=glm_moe_dsa) causal LM, adapted from DeepSeek-V3.2."""
+"""GLM-5.2 (model_type=glm_moe_dsa) causal LM, adapted from DeepSeek-V3.2.
+
+Shared machinery is imported from ``deepseek_v32``: W8A8 linears, dense MLP,
+MoE, YaRN RoPE, the W8A8 weight loader, and the MLA RoPE helpers. Only the
+GLM-5.2 structural deltas live here:
+
+  * cross-layer top-k sharing -- ``indexer_types`` marks full/shared layers;
+    shared layers skip the indexer and reuse the previous full layer's top-k.
+  * indexer ``wq_b`` is W8A8 (not bf16 ``nn.Linear``) and ``weights_proj``
+    stays fp32.
+  * indexer RoPE is configurable (``indexer_rope_interleave``); DSV3.2's
+    indexer uses half-rotate only.
+  * per-layer MLP type comes from ``mlp_layer_types`` (not a single
+    ``first_k_dense_replace`` threshold).
+  * the YaRN ``cos_sin_cache`` is built once at the model level and threaded
+    through ``forward`` (no per-layer rotary module).
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
-
-try:
-    import torch_npu  # noqa: F401
-except ImportError:
-    torch_npu = None  # type: ignore[assignment]
 
 from xllm.python import ops
 from xllm.python.attention.backend import MlaIndexContext
@@ -44,24 +55,13 @@ from xllm.python.models.deepseek_v32 import (
     DeepseekYarnRotaryEmbedding as Glm52YarnRotaryEmbedding,
     W8A8DynamicLinear,
     W8A8StaticLinear,
+    W8A8WeightLoader,
+    _apply_half_rope,
+    _gather_interleave_cos_sin,
+    _interleave_rope_with,
     _tp_rank_from_device,
     _yarn_get_mscale,
 )
-
-
-def _apply_interleave_rope(
-    rotary: nn.Module, x: torch.Tensor, positions: torch.Tensor
-) -> torch.Tensor:
-    """Interleaved RoPE via ``npu_interleave_rope`` for ``[T, H, D]`` tensors."""
-    cos_sin = rotary.cos_sin_cache[positions]
-    half = cos_sin.size(-1) // 2
-    cos32, sin32 = cos_sin[..., :half], cos_sin[..., half:]
-    cos = torch.cat([cos32, cos32], dim=-1).unsqueeze(1).unsqueeze(1)
-    sin = torch.cat([sin32, sin32], dim=-1).unsqueeze(1).unsqueeze(1)
-    t, h, d = x.shape
-    return torch_npu.npu_interleave_rope(
-        x.view(t, h, 1, d), cos, sin
-    ).view(t, h, d)
 
 
 @dataclass
@@ -118,7 +118,7 @@ class Glm52Config:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Glm52Config":
-        def pick(*keys, default=None):
+        def pick(*keys: str, default: Any = None) -> Any:
             for k in keys:
                 if k in d and d[k] is not None:
                     return d[k]
@@ -131,7 +131,7 @@ class Glm52Config:
             if isinstance(rp, dict):
                 rs = rp
 
-        def rpick(*keys, default=None):
+        def rpick(*keys: str, default: Any = None) -> Any:
             for k in keys:
                 if isinstance(rs, dict) and k in rs and rs[k] is not None:
                     return rs[k]
@@ -142,7 +142,7 @@ class Glm52Config:
                     return d[k]
             return default
 
-        def rpick_nz(*keys, default):
+        def rpick_nz(*keys: str, default: Any) -> Any:
             v = rpick(*keys, default=None)
             if v is None or v == 0 or v == -1 or v == "":
                 return default
@@ -198,8 +198,8 @@ class Glm52Config:
             ),
             tp_size=int(pick("tp_size", default=1)),
             tp_rank=int(pick("tp_rank", default=0)),
-            indexer_types=pick("indexer_types", default=None),
-            mlp_layer_types=pick("mlp_layer_types", default=None),
+            indexer_types=pick("indexer_types", default=None) or None,
+            mlp_layer_types=pick("mlp_layer_types", default=None) or None,
             index_skip_topk_offset=int(pick("index_skip_topk_offset", default=2)),
             index_topk_freq=int(pick("index_topk_freq", default=1)),
             index_topk_pattern=pick("index_topk_pattern", default=None),
@@ -305,18 +305,6 @@ class Glm52MLAAttention(Attention):
         )
         self.o_proj = W8A8StaticLinear(num_heads * v_head, cfg.hidden_size, device,
                                        row_parallel=True)
-        self.rotary = Glm52YarnRotaryEmbedding(
-            qk_rope,
-            cfg.original_max_position_embeddings,
-            cfg.rope_scaling_factor,
-            cfg.rope_theta,
-            cfg.rope_beta_fast,
-            cfg.rope_beta_slow,
-            cfg.rope_mscale,
-            cfg.rope_mscale_all_dim,
-            dtype=dtype,
-            device=device,
-        )
         self.register_buffer(
             "W_UK",
             torch.empty(num_heads, qk_nope, kv_lora, dtype=dtype, device=device),
@@ -335,7 +323,6 @@ class Glm52MLAAttention(Attention):
         self.indexer = None
         if not self.is_shared:
             self.indexer = Glm52Indexer(cfg, dtype, device)
-            self.indexer.rotary = self.rotary
 
     def process_weights_after_loading(self) -> None:
         self.q_a_proj.process_weights_after_loading()
@@ -356,15 +343,11 @@ class Glm52MLAAttention(Attention):
         if self.indexer is not None:
             self.indexer.process_weights_after_loading()
 
-    def _interleaved_rope(
-        self, x: torch.Tensor, positions: torch.Tensor
-    ) -> torch.Tensor:
-        return _apply_interleave_rope(self.rotary, x, positions)
-
     def forward(
         self,
         hidden: torch.Tensor,
         positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         num_tokens = hidden.shape[0]
@@ -373,7 +356,9 @@ class Glm52MLAAttention(Attention):
         backend = get_forward_context().attention_backend
         if self.indexer is not None:
             ctx = backend.mla_index_context(self)
-            topk = self.indexer.select_qli(hidden, q_c, positions, ctx)
+            topk = self.indexer.select_qli(
+                hidden, q_c, positions, ctx, cos_sin_cache
+            )
         else:
             if prev_topk_indices is None:
                 raise ValueError(
@@ -393,15 +378,14 @@ class Glm52MLAAttention(Attention):
         q_latent = torch.bmm(
             q_nope.transpose(0, 1), self.W_UK
         ).transpose(0, 1)
-        q_pe = self._interleaved_rope(q_rope, positions)
+        cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
+        q_pe = _interleave_rope_with(q_rope, cos, sin)
         kv = self.kv_a_proj_with_mqa(hidden)
         k_latent_raw, k_rope_raw = kv.split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
         k_latent = self.kv_a_layernorm(k_latent_raw)
-        k_pe = self._interleaved_rope(
-            k_rope_raw.unsqueeze(1), positions
-        )
+        k_pe = _interleave_rope_with(k_rope_raw.unsqueeze(1), cos, sin)
         k_latent_3d = k_latent.view(num_tokens, 1, self.kv_lora_rank)
         k_pe_3d = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)
 
@@ -421,7 +405,7 @@ class Glm52MLAAttention(Attention):
 
 
 class Glm52Indexer(nn.Module):
-    """GLM-5.2 DSA lightning indexer (wq_b W8A8, weights_proj fp32, interleave RoPE)."""
+    """GLM-5.2 DSA lightning indexer (wq_b W8A8, weights_proj fp32, configurable RoPE)."""
 
     def __init__(self, cfg: Glm52Config, dtype: torch.dtype,
                  device: torch.device) -> None:
@@ -430,6 +414,7 @@ class Glm52Indexer(nn.Module):
         self.head_dim = cfg.index_head_dim
         self.rope_dim = cfg.qk_rope_head_dim
         self.topk = cfg.index_topk
+        self.indexer_rope_interleave = cfg.indexer_rope_interleave
         self.wq_b = W8A8StaticLinear(cfg.q_lora_rank, self.n_head * self.head_dim,
                                      device)
         self.wk = nn.Linear(cfg.hidden_size, self.head_dim,
@@ -439,13 +424,17 @@ class Glm52Indexer(nn.Module):
                                       device=device)
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6,
                                    dtype=dtype, device=device)
-        self.rotary = None
 
     def process_weights_after_loading(self) -> None:
         self.wq_b.process_weights_after_loading()
 
     def select_qli(
-        self, hidden, qr, positions, ctx: MlaIndexContext
+        self,
+        hidden: torch.Tensor,
+        qr: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: MlaIndexContext,
+        cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
         index_cache = ctx.index_cache
         slot_mapping = ctx.slot_mapping
@@ -461,8 +450,17 @@ class Glm52Indexer(nn.Module):
         k_pe, k_nope = torch.split(
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
-        q_pe = self._interleave_rope(q_pe, positions)
-        k_pe = self._interleave_rope(k_pe.unsqueeze(1), positions).squeeze(1)
+        if self.indexer_rope_interleave:
+            cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
+            q_pe = _interleave_rope_with(q_pe, cos, sin)
+            k_pe = _interleave_rope_with(
+                k_pe.unsqueeze(1), cos, sin
+            ).squeeze(1)
+        else:
+            q_pe = _apply_half_rope(cos_sin_cache, q_pe, positions)
+            k_pe = _apply_half_rope(
+                k_pe.unsqueeze(1), cos_sin_cache, positions
+            ).squeeze(1)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
         if index_cache is not None and slot_mapping is not None:
@@ -479,11 +477,6 @@ class Glm52Indexer(nn.Module):
             False,
         )
         return topk
-
-    def _interleave_rope(
-        self, x: torch.Tensor, positions: torch.Tensor
-    ) -> torch.Tensor:
-        return _apply_interleave_rope(self.rotary, x, positions)
 
 
 class Glm52DecoderLayer(nn.Module):
@@ -521,6 +514,7 @@ class Glm52DecoderLayer(nn.Module):
         hidden: torch.Tensor,
         residual: Optional[torch.Tensor],
         positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -528,7 +522,9 @@ class Glm52DecoderLayer(nn.Module):
             hidden = self.input_layernorm(hidden)
         else:
             hidden, residual = self.input_layernorm(hidden, residual)
-        hidden, topk_indices = self.self_attn(hidden, positions, prev_topk_indices)
+        hidden, topk_indices = self.self_attn(
+            hidden, positions, cos_sin_cache, prev_topk_indices
+        )
         hidden, residual = self.post_attention_layernorm(hidden, residual)
         hidden = self.mlp(hidden)
         return hidden, residual, topk_indices
@@ -558,17 +554,30 @@ class Glm52Model(nn.Module):
         self.norm = RMSNorm(
             cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device
         )
+        self.rotary = Glm52YarnRotaryEmbedding(
+            cfg.qk_rope_head_dim,
+            cfg.original_max_position_embeddings,
+            cfg.rope_scaling_factor,
+            cfg.rope_theta,
+            cfg.rope_beta_fast,
+            cfg.rope_beta_slow,
+            cfg.rope_mscale,
+            cfg.rope_mscale_all_dim,
+            dtype=dtype,
+            device=device,
+        )
 
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
         hidden = self.embed_tokens(input_ids)
         positions = positions.to(torch.int64).contiguous()
+        cos_sin_cache = self.rotary.cos_sin_cache
         residual: Optional[torch.Tensor] = None
         prev_topk: Optional[torch.Tensor] = None
         for layer in self.layers:
             hidden, residual, prev_topk = layer(
-                hidden, residual, positions, prev_topk
+                hidden, residual, positions, cos_sin_cache, prev_topk
             )
         hidden, last_hidden = self.norm(hidden, residual)
         return hidden
@@ -608,112 +617,43 @@ class Glm52ForCausalLM(PyModelBase):
         tp_size: int,
     ) -> None:
         cfg = self.cfg
-        tp_size = cfg.tp_size
-        tp_rank = cfg.tp_rank
+        loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
 
-        params_by_name = dict(self.named_parameters())
-        buffers_by_name = dict(self.named_buffers())
-
-        def find(name: str):
-            for sd in state_dicts:
-                if sd.has(name):
-                    return sd
-            return None
-
-        def load_tensor(name: str) -> torch.Tensor:
-            sd = find(name)
-            assert sd is not None, f"checkpoint tensor not found: {name}"
-            return sd.get_tensor(name)
-
-        def shard(t: torch.Tensor, dim: int, world: int = tp_size, rank: int = tp_rank) -> torch.Tensor:
-            if world <= 1:
-                return t
-            cs = t.size(dim) // world
-            return t.narrow(dim, rank * cs, cs).contiguous()
-
-        def copy_in(param_name: str, tensor: torch.Tensor) -> None:
-            p = params_by_name.get(param_name)
-            if p is None:
-                p = buffers_by_name.get(param_name)
-            assert p is not None, f"no parameter/buffer named {param_name}"
-            p.data.copy_(tensor.to(dtype=p.dtype, device=p.device))
-
-        def load_w8a8_a(prefix: str, proj: str, shard_dims=None) -> None:
-            for suffix in ("weight", "deq_scale", "quant_bias",
-                           "input_scale", "input_offset"):
-                t = load_tensor(prefix + proj + "." + suffix)
-                dim = (shard_dims or {}).get(suffix)
-                if dim is not None:
-                    t = shard(t, dim=dim)
-                copy_in(prefix + proj + "." + suffix, t)
-
-        def load_w8a8_b(mlp_pfx: str) -> None:
-            gw = load_tensor(mlp_pfx + "gate_proj.weight")
-            gs = load_tensor(mlp_pfx + "gate_proj.weight_scale")
-            go = load_tensor(mlp_pfx + "gate_proj.weight_offset")
-            uw = load_tensor(mlp_pfx + "up_proj.weight")
-            us = load_tensor(mlp_pfx + "up_proj.weight_scale")
-            uo = load_tensor(mlp_pfx + "up_proj.weight_offset")
-            copy_in(mlp_pfx + "gate_up_proj.weight",
-                    torch.cat([shard(gw, 0), shard(uw, 0)], dim=0).contiguous())
-            copy_in(mlp_pfx + "gate_up_proj.weight_scale",
-                    torch.cat([shard(gs, 0), shard(us, 0)], dim=0).contiguous())
-            copy_in(mlp_pfx + "gate_up_proj.weight_offset",
-                    torch.cat([shard(go, 0), shard(uo, 0)], dim=0).contiguous())
-            copy_in(mlp_pfx + "down_proj.weight",
-                    shard(load_tensor(mlp_pfx + "down_proj.weight"), dim=1))
-            copy_in(mlp_pfx + "down_proj.weight_scale",
-                    load_tensor(mlp_pfx + "down_proj.weight_scale"))
-            copy_in(mlp_pfx + "down_proj.weight_offset",
-                    load_tensor(mlp_pfx + "down_proj.weight_offset"))
-
-        def layer_is_shared(i: int) -> bool:
-            return (
-                cfg.indexer_types is not None
-                and i < len(cfg.indexer_types)
-                and cfg.indexer_types[i] == "shared"
-            )
-
-        def layer_mlp_type(i: int) -> str:
-            if cfg.mlp_layer_types is not None and i < len(cfg.mlp_layer_types):
-                return cfg.mlp_layer_types[i]
-            return "dense" if i < cfg.first_k_dense_replace else "sparse"
-
-        copy_in("model.embed_tokens.weight",
-                shard(load_tensor("model.embed_tokens.weight"), dim=1))
+        loader.copy_in("model.embed_tokens.weight",
+                       loader.shard(loader.load_tensor("model.embed_tokens.weight"), dim=1))
 
         for i in range(cfg.n_layers):
             p = f"model.layers.{i}."
-            copy_in(p + "input_layernorm.weight",
-                    load_tensor(p + "input_layernorm.weight"))
-            copy_in(p + "post_attention_layernorm.weight",
-                    load_tensor(p + "post_attention_layernorm.weight"))
+            loader.copy_in(p + "input_layernorm.weight",
+                           loader.load_tensor(p + "input_layernorm.weight"))
+            loader.copy_in(p + "post_attention_layernorm.weight",
+                           loader.load_tensor(p + "post_attention_layernorm.weight"))
             attn = p + "self_attn."
-            load_w8a8_a(attn, "q_a_proj")
-            copy_in(attn + "q_a_layernorm.weight",
-                    load_tensor(attn + "q_a_layernorm.weight"))
-            load_w8a8_a(attn, "q_b_proj",
-                        {"weight": 0, "deq_scale": 0, "quant_bias": 0})
-            load_w8a8_a(attn, "kv_a_proj_with_mqa")
-            copy_in(attn + "kv_a_layernorm.weight",
-                    load_tensor(attn + "kv_a_layernorm.weight"))
-            copy_in(attn + "kv_b_proj.weight",
-                    shard(load_tensor(attn + "kv_b_proj.weight"), dim=0))
-            load_w8a8_a(attn, "o_proj", {"weight": 1})
-            if not layer_is_shared(i):
+            loader.load_w8a8_a(attn, "q_a_proj")
+            loader.copy_in(attn + "q_a_layernorm.weight",
+                           loader.load_tensor(attn + "q_a_layernorm.weight"))
+            loader.load_w8a8_a(attn, "q_b_proj",
+                               {"weight": 0, "deq_scale": 0, "quant_bias": 0})
+            loader.load_w8a8_a(attn, "kv_a_proj_with_mqa")
+            loader.copy_in(attn + "kv_a_layernorm.weight",
+                           loader.load_tensor(attn + "kv_a_layernorm.weight"))
+            loader.copy_in(attn + "kv_b_proj.weight",
+                           loader.shard(loader.load_tensor(attn + "kv_b_proj.weight"), dim=0))
+            loader.load_w8a8_a(attn, "o_proj", {"weight": 1})
+            if not self.model.layers[i].self_attn.is_shared:
                 idx = attn + "indexer."
-                load_w8a8_a(idx, "wq_b")
-                copy_in(idx + "wk.weight", load_tensor(idx + "wk.weight"))
-                copy_in(idx + "k_norm.weight",
-                        load_tensor(idx + "k_norm.weight"))
-                copy_in(idx + "k_norm.bias", load_tensor(idx + "k_norm.bias"))
-                copy_in(idx + "weights_proj.weight",
-                        load_tensor(idx + "weights_proj.weight"))
+                loader.load_w8a8_a(idx, "wq_b")
+                loader.copy_in(idx + "wk.weight", loader.load_tensor(idx + "wk.weight"))
+                loader.copy_in(idx + "k_norm.weight",
+                               loader.load_tensor(idx + "k_norm.weight"))
+                loader.copy_in(idx + "k_norm.bias",
+                               loader.load_tensor(idx + "k_norm.bias"))
+                loader.copy_in(idx + "weights_proj.weight",
+                               loader.load_tensor(idx + "weights_proj.weight"))
             self.model.layers[i].self_attn.process_weights_after_loading()
 
-            mlp_type = layer_mlp_type(i)
-            if mlp_type == "dense":
-                load_w8a8_b(p + "mlp.")
+            if isinstance(self.model.layers[i].mlp, Glm52MLP):
+                loader.load_w8a8_b(p + "mlp.")
                 self.model.layers[i].mlp.process_weights_after_loading()
             else:
                 se = p + "mlp.experts."
@@ -724,29 +664,31 @@ class Glm52ForCausalLM(PyModelBase):
                 w2_scale = self.get_buffer(p + "mlp.experts_w2_scale")
                 w2_offset = self.get_buffer(p + "mlp.experts_w2_offset")
                 for j in range(cfg.n_routed_experts):
-                    gw = load_tensor(se + f"{j}.gate_proj.weight")
-                    gs = load_tensor(se + f"{j}.gate_proj.weight_scale")
-                    go = load_tensor(se + f"{j}.gate_proj.weight_offset")
-                    uw = load_tensor(se + f"{j}.up_proj.weight")
-                    us = load_tensor(se + f"{j}.up_proj.weight_scale")
-                    uo = load_tensor(se + f"{j}.up_proj.weight_offset")
-                    dw = load_tensor(se + f"{j}.down_proj.weight")
-                    ds = load_tensor(se + f"{j}.down_proj.weight_scale")
-                    do = load_tensor(se + f"{j}.down_proj.weight_offset")
+                    gw = loader.load_tensor(se + f"{j}.gate_proj.weight")
+                    gs = loader.load_tensor(se + f"{j}.gate_proj.weight_scale")
+                    go = loader.load_tensor(se + f"{j}.gate_proj.weight_offset")
+                    uw = loader.load_tensor(se + f"{j}.up_proj.weight")
+                    us = loader.load_tensor(se + f"{j}.up_proj.weight_scale")
+                    uo = loader.load_tensor(se + f"{j}.up_proj.weight_offset")
+                    dw = loader.load_tensor(se + f"{j}.down_proj.weight")
+                    ds = loader.load_tensor(se + f"{j}.down_proj.weight_scale")
+                    do = loader.load_tensor(se + f"{j}.down_proj.weight_offset")
                     w13_param.data[j].copy_(
-                        torch.cat([shard(gw, 0), shard(uw, 0)], dim=0).contiguous())
+                        torch.cat([loader.shard(gw, 0), loader.shard(uw, 0)], dim=0).contiguous())
                     w13_scale.data[j].copy_(
-                        torch.cat([shard(gs, 0), shard(us, 0)], dim=0).contiguous())
+                        torch.cat([loader.shard(gs, 0), loader.shard(us, 0)], dim=0).contiguous())
                     w13_offset.data[j].copy_(
-                        torch.cat([shard(go, 0), shard(uo, 0)], dim=0).contiguous())
-                    w2_param.data[j].copy_(shard(dw, 1).contiguous())
+                        torch.cat([loader.shard(go, 0), loader.shard(uo, 0)], dim=0).contiguous())
+                    w2_param.data[j].copy_(loader.shard(dw, 1).contiguous())
                     w2_scale.data[j].copy_(ds.contiguous())
                     w2_offset.data[j].copy_(do.contiguous())
-                copy_in(p + "mlp.gate.weight", load_tensor(p + "mlp.gate.weight"))
-                copy_in(p + "mlp.e_score_correction_bias",
-                        load_tensor(p + "mlp.gate.e_score_correction_bias"))
-                load_w8a8_b(p + "mlp.shared_experts.")
+                loader.copy_in(p + "mlp.gate.weight",
+                               loader.load_tensor(p + "mlp.gate.weight"))
+                loader.copy_in(p + "mlp.e_score_correction_bias",
+                               loader.load_tensor(p + "mlp.gate.e_score_correction_bias"))
+                loader.load_w8a8_b(p + "mlp.shared_experts.")
                 self.model.layers[i].mlp.process_weights_after_loading()
 
-        copy_in("model.norm.weight", load_tensor("model.norm.weight"))
-        copy_in("lm_head.weight", shard(load_tensor("lm_head.weight"), dim=0))
+        loader.copy_in("model.norm.weight", loader.load_tensor("model.norm.weight"))
+        loader.copy_in("lm_head.weight",
+                       loader.shard(loader.load_tensor("lm_head.weight"), dim=0))
