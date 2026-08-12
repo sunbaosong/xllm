@@ -63,6 +63,23 @@ def _ensure_tilelang_ascend_ready(target_platform: str, arch: str) -> None:
     prepare_ascend(target_platform, arch)
 
 
+def _maybe_install_fla_npu(device: str) -> None:
+    """Ensure the fla_npu AscendC fused KDA ops are importable.
+
+    No-op for non-NPU devices, and a no-op when the active environment already
+    imports the KDA ops (``chunk_kda_fwd`` / ``recurrent_kda`` / ``causal_conv1d``);
+    otherwise builds and force-installs the fla_npu wheel from source.
+    """
+    if device != "npu":
+        return
+    compiler_parent = os.path.join(get_base_dir(), "xllm")
+    if compiler_parent not in sys.path:
+        sys.path.insert(0, compiler_parent)
+    from compiler.fla_npu.bootstrap import prepare_fla_npu
+
+    prepare_fla_npu()
+
+
 def _maybe_compile_tilelang_kernels(device: str, jobs: int | str | None = None) -> None:
     if device != "npu":
         return
@@ -404,6 +421,7 @@ class ExtBuild(build_ext):
             cmake_args += ["-DUSE_NPU=ON"]
             set_npu_envs()
             _maybe_compile_tilelang_kernels(self.device, self.tilelang_jobs)
+            _maybe_install_fla_npu(self.device)
         elif self.device == "mlu":
             cmake_args += ["-DUSE_MLU=ON"]
             set_mlu_envs()
